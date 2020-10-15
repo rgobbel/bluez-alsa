@@ -467,7 +467,9 @@ static int bluealsa_get_attribute(snd_ctl_ext_t *ext, snd_ctl_ext_key_t key,
 		*count = pcm->channels;
 		break;
 	case CTL_ELEM_TYPE_VOLUME:
-		*acc = SND_CTL_EXT_ACCESS_READWRITE;
+		*acc = SND_CTL_EXT_ACCESS_READWRITE |
+			SND_CTL_EXT_ACCESS_TLV_CALLBACK |
+			SND_CTL_EXT_ACCESS_TLV_READ;
 		*type = SND_CTL_ELEM_TYPE_INTEGER;
 		*count = pcm->channels;
 		break;
@@ -837,6 +839,30 @@ static const snd_ctl_ext_callback_t bluealsa_snd_ctl_ext_callback = {
 	.poll_revents = bluealsa_poll_revents,
 };
 
+#if SND_CTL_EXT_VERSION >= 0x010001
+static int bluealsa_snd_ctl_ext_tlv_callback(snd_ctl_ext_t *ext,
+		snd_ctl_ext_key_t key, int op_flag, unsigned int numid,
+		unsigned int *tlv, unsigned int tlv_size) {
+	(void)ext;
+	(void)key;
+	(void)numid;
+
+	static const unsigned int tlv_db[] = {
+		4, /* dB scale with min/max */
+		2 * sizeof(unsigned int),
+		-6400, 0,
+	};
+
+	if (op_flag != 0)
+		return -ENXIO;
+	if (tlv_size < sizeof(tlv_db))
+		return -ENOMEM;
+
+	memcpy(tlv, tlv_db, sizeof(tlv_db));
+	return 0;
+}
+#endif
+
 SND_CTL_PLUGIN_DEFINE_FUNC(bluealsa) {
 	(void)root;
 
@@ -918,6 +944,9 @@ SND_CTL_PLUGIN_DEFINE_FUNC(bluealsa) {
 	strncpy(ctl->ext.mixername, "BlueALSA Plugin", sizeof(ctl->ext.mixername) - 1);
 
 	ctl->ext.callback = &bluealsa_snd_ctl_ext_callback;
+#if SND_CTL_EXT_VERSION >= 0x010001
+	ctl->ext.tlv.c = bluealsa_snd_ctl_ext_tlv_callback;
+#endif
 	ctl->ext.private_data = ctl;
 	ctl->ext.poll_fd = -1;
 

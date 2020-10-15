@@ -106,6 +106,9 @@ static void ba_transport_pcm_scale(
 	double ch1_scale = 0;
 	double ch2_scale = 0;
 
+	/* Scaling function is based on the decibel formula pow(10, dB / 20),
+	 * where dB is in the range from -64dB to 0dB linearly mapped on the
+	 * PCM level property exposed by our D-Bus API. */
 	if (!pcm->volume[0].muted)
 		ch1_scale = pow(10, (-64 + 64.0 * pcm->volume[0].level / vmax) / 20);
 	if (!pcm->volume[1].muted)

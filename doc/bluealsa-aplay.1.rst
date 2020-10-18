@@ -6,7 +6,7 @@ bluealsa-aplay
 a simple bluealsa player
 ------------------------
 
-:Date: August 2020
+:Date: October 2020
 :Manual section: 1
 :Manual group: General Commands Manual
 :Version: $VERSION$
@@ -65,6 +65,18 @@ OPTIONS
     The default is 100000.
     ALSA may choose the nearest available alternative if the requested value is
     not supported.
+
+-M NAME, --mixer=NAME
+    Select ALSA mixer device to use for controlling audio output.
+    The default is ``default``.
+
+--mixer-name=NAME
+    Set the name of the mixer element.
+    The default is ``Master``.
+
+--mixer-index=NB
+    Set the index of the mixer channel.
+    The default is ``0``.
 
 --profile-a2dp
     Use A2DP profile (default).

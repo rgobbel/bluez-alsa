@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ba-transport.h
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -8,6 +8,7 @@
  *
  */
 
+#pragma once
 #ifndef BLUEALSA_BATRANSPORT_H_
 #define BLUEALSA_BATRANSPORT_H_
 
@@ -99,6 +100,9 @@ struct ba_transport_pcm {
 	/* PCM stream operation mode */
 	enum ba_transport_pcm_mode mode;
 
+	/* PCM access guard */
+	pthread_mutex_t mutex;
+
 	/* FIFO file descriptor */
 	int fd;
 
@@ -132,9 +136,6 @@ struct ba_transport_pcm {
 	pthread_mutex_t synced_mtx;
 	pthread_cond_t synced;
 
-	/* PCM access synchronization */
-	pthread_mutex_t dbus_mtx;
-
 	/* exported PCM D-Bus API */
 	char *ba_dbus_path;
 	unsigned int ba_dbus_id;
@@ -144,14 +145,10 @@ struct ba_transport_pcm {
 struct ba_transport_thread {
 	/* backward reference to transport */
 	struct ba_transport *t;
-	/* guard thread structure */
-	pthread_mutex_t mutex;
 	/* actual thread ID */
 	pthread_t id;
 	/* notification PIPE */
 	int pipe[2];
-	/* indicates cleanup lock */
-	bool cleanup_lock;
 	/* thread synchronization */
 	pthread_mutex_t ready_mtx;
 	pthread_cond_t ready;
@@ -272,6 +269,9 @@ void ba_transport_unref(struct ba_transport *t);
 struct ba_transport_pcm *ba_transport_pcm_ref(struct ba_transport_pcm *pcm);
 void ba_transport_pcm_unref(struct ba_transport_pcm *pcm);
 
+int ba_transport_pcms_lock(struct ba_transport *t);
+int ba_transport_pcms_unlock(struct ba_transport *t);
+
 int ba_transport_select_codec_a2dp(
 		struct ba_transport *t,
 		const struct a2dp_sep *sep);
@@ -285,6 +285,9 @@ void ba_transport_set_codec(
 
 int ba_transport_start(struct ba_transport *t);
 int ba_transport_stop(struct ba_transport *t);
+
+int ba_transport_acquire(struct ba_transport *t);
+int ba_transport_release(struct ba_transport *t);
 
 int ba_transport_set_a2dp_state(
 		struct ba_transport *t,

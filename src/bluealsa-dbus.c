@@ -325,8 +325,10 @@ static gboolean bluealsa_pcm_controller(GIOChannel *ch, GIOCondition condition,
 	case G_IO_STATUS_AGAIN:
 		return TRUE;
 	case G_IO_STATUS_EOF:
+		pthread_mutex_lock(&pcm->mutex);
 		ba_transport_pcm_release(pcm);
 		ba_transport_thread_send_signal(pcm->th, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
+		pthread_mutex_unlock(&pcm->mutex);
 		/* remove channel from watch */
 		return FALSE;
 	}
@@ -346,12 +348,7 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 
 	/* Prevent two (or more) clients trying to
 	 * open the same PCM at the same time. */
-	pthread_mutex_lock(&pcm->dbus_mtx);
-
-	/* We must ensure that transport release is not in progress before
-	 * accessing transport critical section. Otherwise, we might have
-	 * the IO thread closing it in the middle of the open procedure! */
-	ba_transport_thread_cleanup_lock(th);
+	pthread_mutex_lock(&pcm->mutex);
 
 	/* preliminary check whether HFP codes is selected */
 	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO &&
@@ -389,7 +386,7 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 	 * like A2DP Sink and HFP headset, we will wait for incoming connection. */
 	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SOURCE ||
 			t->type.profile & BA_TRANSPORT_PROFILE_MASK_AG)
-		if (t->acquire(t) == -1) {
+		if (ba_transport_acquire(t) == -1) {
 			g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
 					G_DBUS_ERROR_FAILED, "Acquire transport: %s", strerror(errno));
 			goto fail;
@@ -419,8 +416,7 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 		pthread_mutex_unlock(&th->ready_mtx);
 	}
 
-	ba_transport_thread_cleanup_unlock(th);
-	pthread_mutex_unlock(&pcm->dbus_mtx);
+	pthread_mutex_unlock(&pcm->mutex);
 	ba_transport_pcm_unref(pcm);
 
 	int fds[2] = { pcm_fds[is_sink ? 1 : 0], pcm_fds[3] };
@@ -432,8 +428,7 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 	return;
 
 fail:
-	ba_transport_thread_cleanup_unlock(th);
-	pthread_mutex_unlock(&pcm->dbus_mtx);
+	pthread_mutex_unlock(&pcm->mutex);
 	ba_transport_pcm_unref(pcm);
 	/* clean up created file descriptors */
 	for (i = 0; i < ARRAYSIZE(pcm_fds); i++)
@@ -520,9 +515,6 @@ static void bluealsa_pcm_select_codec(GDBusMethodInvocation *inv) {
 		value = NULL;
 	}
 
-	/* synchronize codec selection and e.g. PCM open */
-	pthread_mutex_lock(&pcm->dbus_mtx);
-
 	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
 
 		/* support for Stream End-Points not enabled in BlueZ */
@@ -594,7 +586,6 @@ fail:
 			G_DBUS_ERROR_FAILED, "%s", errmsg);
 
 final:
-	pthread_mutex_unlock(&pcm->dbus_mtx);
 	ba_transport_pcm_unref(pcm);
 	g_free(a2dp_configuration);
 	g_variant_iter_free(properties);

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ba-transport.c
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -76,7 +76,7 @@ static int transport_pcm_init(
 	pcm->mode = mode;
 	pcm->fd = -1;
 
-	pthread_mutex_init(&pcm->dbus_mtx, NULL);
+	pthread_mutex_init(&pcm->mutex, NULL);
 	pthread_mutex_init(&pcm->synced_mtx, NULL);
 	pthread_cond_init(&pcm->synced, NULL);
 
@@ -90,9 +90,11 @@ static int transport_pcm_init(
 static void transport_pcm_free(
 		struct ba_transport_pcm *pcm) {
 
+	pthread_mutex_lock(&pcm->mutex);
 	ba_transport_pcm_release(pcm);
+	pthread_mutex_unlock(&pcm->mutex);
 
-	pthread_mutex_destroy(&pcm->dbus_mtx);
+	pthread_mutex_destroy(&pcm->mutex);
 	pthread_mutex_destroy(&pcm->synced_mtx);
 	pthread_cond_destroy(&pcm->synced);
 
@@ -110,7 +112,6 @@ static int transport_thread_init(
 	th->pipe[0] = -1;
 	th->pipe[1] = -1;
 
-	pthread_mutex_init(&th->mutex, NULL);
 	pthread_mutex_init(&th->ready_mtx, NULL);
 	pthread_cond_init(&th->ready, NULL);
 
@@ -150,7 +151,6 @@ static void transport_thread_free(
 		close(th->pipe[0]);
 	if (th->pipe[1] != -1)
 		close(th->pipe[1]);
-	pthread_mutex_destroy(&th->mutex);
 	pthread_mutex_destroy(&th->ready_mtx);
 	pthread_cond_destroy(&th->ready);
 }
@@ -368,6 +368,8 @@ void ba_transport_destroy(struct ba_transport *t) {
 	transport_thread_cancel(&t->thread_enc);
 	transport_thread_cancel(&t->thread_dec);
 
+	ba_transport_pcms_lock(t);
+
 	/* terminate on-going PCM connections - exit PCM controllers */
 	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
 		ba_transport_pcm_release(&t->a2dp.pcm);
@@ -380,7 +382,9 @@ void ba_transport_destroy(struct ba_transport *t) {
 
 	/* if possible, try to release resources gracefully */
 	if (t->release != NULL)
-		t->release(t);
+		ba_transport_release(t);
+
+	ba_transport_pcms_unlock(t);
 
 	ba_transport_unref(t);
 }
@@ -438,6 +442,36 @@ void ba_transport_pcm_unref(struct ba_transport_pcm *pcm) {
 	ba_transport_unref(pcm->t);
 }
 
+int ba_transport_pcms_lock(struct ba_transport *t) {
+	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
+		pthread_mutex_lock(&t->a2dp.pcm.mutex);
+		pthread_mutex_lock(&t->a2dp.pcm_bc.mutex);
+		return 0;
+	}
+	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO) {
+		pthread_mutex_lock(&t->sco.spk_pcm.mutex);
+		pthread_mutex_lock(&t->sco.mic_pcm.mutex);
+		return 0;
+	}
+	errno = EINVAL;
+	return -1;
+}
+
+int ba_transport_pcms_unlock(struct ba_transport *t) {
+	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
+		pthread_mutex_unlock(&t->a2dp.pcm.mutex);
+		pthread_mutex_unlock(&t->a2dp.pcm_bc.mutex);
+		return 0;
+	}
+	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO) {
+		pthread_mutex_unlock(&t->sco.spk_pcm.mutex);
+		pthread_mutex_unlock(&t->sco.mic_pcm.mutex);
+		return 0;
+	}
+	errno = EINVAL;
+	return -1;
+}
+
 int ba_transport_select_codec_a2dp(
 		struct ba_transport *t,
 		const struct a2dp_sep *sep) {
@@ -489,10 +523,14 @@ int ba_transport_select_codec_sco(
 		struct ba_rfcomm * const r = t->sco.rfcomm;
 		pthread_mutex_lock(&r->codec_selection_completed_mtx);
 
+		ba_transport_pcms_lock(t);
+
 		/* release ongoing connection */
 		ba_transport_pcm_release(&t->sco.spk_pcm);
 		ba_transport_pcm_release(&t->sco.mic_pcm);
-		t->release(t);
+		ba_transport_release(t);
+
+		ba_transport_pcms_unlock(t);
 
 		switch (codec_id) {
 		case HFP_CODEC_CVSD:
@@ -683,6 +721,28 @@ int ba_transport_stop(struct ba_transport *t) {
 	return 0;
 }
 
+int ba_transport_acquire(struct ba_transport *t) {
+	return t->acquire(t);
+}
+
+int ba_transport_release(struct ba_transport *t) {
+
+#if DEBUG
+	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
+		/* assert that we were called with the locks held */
+		g_assert_cmpint(pthread_mutex_trylock(&t->a2dp.pcm.mutex), !=, 0);
+		g_assert_cmpint(pthread_mutex_trylock(&t->a2dp.pcm_bc.mutex), !=, 0);
+	}
+	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO) {
+		/* assert that we were called with the locks held */
+		g_assert_cmpint(pthread_mutex_trylock(&t->sco.spk_pcm.mutex), !=, 0);
+		g_assert_cmpint(pthread_mutex_trylock(&t->sco.mic_pcm.mutex), !=, 0);
+	}
+#endif
+
+	return t->release(t);
+}
+
 int ba_transport_set_a2dp_state(
 		struct ba_transport *t,
 		enum bluez_a2dp_transport_state state) {
@@ -692,7 +752,7 @@ int ba_transport_set_a2dp_state(
 		 * if we are handing A2DP sink profile. For source profile, transport has
 		 * to be acquired by our controller (during the PCM open request). */
 		if (t->type.profile == BA_TRANSPORT_PROFILE_A2DP_SINK)
-			return t->acquire(t);
+			return ba_transport_acquire(t);
 		return 0;
 	case BLUEZ_A2DP_TRANSPORT_STATE_ACTIVE:
 		return ba_transport_start(t);
@@ -998,25 +1058,20 @@ final:
 
 int ba_transport_pcm_release(struct ba_transport_pcm *pcm) {
 
+#if DEBUG
+	if (pcm->t->type.profile != BA_TRANSPORT_PROFILE_NONE)
+		/* assert that we were called with the lock held */
+		g_assert_cmpint(pthread_mutex_trylock(&pcm->mutex), !=, 0);
+#endif
+
 	if (pcm->fd == -1)
-		return 0;
-
-	int oldstate;
-
-	/* Transport IO workers are managed using thread cancellation mechanism,
-	 * so we have to take into account a possibility of cancellation during the
-	 * execution. In this release function it is important to perform actions
-	 * atomically. Since close call is a cancellation point, it is required to
-	 * temporally disable cancellation. For a better understanding of what is
-	 * going on, see the io_pcm_read() function. */
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
+		goto final;
 
 	debug("Closing PCM: %d", pcm->fd);
 	close(pcm->fd);
 	pcm->fd = -1;
 
-	pthread_setcancelstate(oldstate, NULL);
-
+final:
 	return 0;
 }
 
@@ -1077,10 +1132,11 @@ enum ba_transport_signal ba_transport_thread_recv_signal(
 }
 
 /**
- * Wrapper for release callback, which can be used by the pthread cleanup.
+ * Wrapper for release callback used by the IO threads pthread cleanup.
  *
- * This function CAN be used with ba_transport_thread_cleanup_lock() in order
- * to guard transport thread critical section during cleanup process. */
+ * This function SHALL be used with the ba_transport_thread_cleanup_lock()
+ * in order guarantee that the PCM will not be accessed in the middle of
+ * the transport release procedure. */
 void ba_transport_thread_cleanup(struct ba_transport_thread *th) {
 
 	struct ba_transport *t = th->t;
@@ -1089,7 +1145,7 @@ void ba_transport_thread_cleanup(struct ba_transport_thread *th) {
 	 * be NULL. Hence, we will relay on this callback - file descriptors
 	 * are closed in it. */
 	if (t->release != NULL)
-		t->release(t);
+		ba_transport_release(t);
 
 	ba_transport_thread_cleanup_unlock(th);
 
@@ -1102,14 +1158,9 @@ void ba_transport_thread_cleanup(struct ba_transport_thread *th) {
 }
 
 int ba_transport_thread_cleanup_lock(struct ba_transport_thread *th) {
-	int ret = pthread_mutex_lock(&th->mutex);
-	th->cleanup_lock = true;
-	return ret;
+	return ba_transport_pcms_lock(th->t);
 }
 
 int ba_transport_thread_cleanup_unlock(struct ba_transport_thread *th) {
-	if (!th->cleanup_lock)
-		return 0;
-	th->cleanup_lock = false;
-	return pthread_mutex_unlock(&th->mutex);
+	return ba_transport_pcms_unlock(th->t);
 }

@@ -292,7 +292,7 @@ static struct ba_transport *mock_transport_new_a2dp(const char *device_btmac,
 			device_btmac, ba_transport_codecs_a2dp_to_string(t->type.codec));
 	t->acquire = mock_transport_acquire;
 	if (type.profile == BA_TRANSPORT_PROFILE_A2DP_SINK)
-		assert(t->acquire(t) == 0);
+		assert(ba_transport_acquire(t) == 0);
 	ba_device_unref(d);
 	return t;
 }

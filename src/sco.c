@@ -361,7 +361,6 @@ void *sco_thread(struct ba_transport_thread *th) {
 
 			uint8_t *buffer;
 			size_t buffer_len;
-			ssize_t len;
 
 			switch (codec) {
 			case HFP_CODEC_CVSD:
@@ -369,30 +368,22 @@ void *sco_thread(struct ba_transport_thread *th) {
 				if (t->sco.mic_pcm.fd == -1)
 					ffb_rewind(&bt_in);
 				buffer = bt_in.tail;
-				buffer_len = ffb_len_in(&bt_in);
+				buffer_len = ffb_blen_in(&bt_in);
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
 				buffer = msbc_dec.data.tail;
-				buffer_len = ffb_len_in(&msbc_dec.data);
+				buffer_len = ffb_blen_in(&msbc_dec.data);
 				break;
 #endif
 			}
 
-retry_sco_read:
-			errno = 0;
-			if ((len = read(pfds[1].fd, buffer, buffer_len)) <= 0)
-				switch (errno) {
-				case EINTR:
-					goto retry_sco_read;
-				case 0:
-				case ECONNABORTED:
-				case ECONNRESET:
-					goto release;
-				default:
-					error("SCO read error: %s", strerror(errno));
-					continue;
-				}
+			ssize_t len;
+			if ((len = io_bt_read(t, buffer, buffer_len)) <= 0) {
+				if (len == -1)
+					debug("BT read error: %s", strerror(errno));
+				continue;
+			}
 
 			/* If microphone (capture) PCM is not connected ignore incoming data. In
 			 * the worst case scenario, we might lose few milliseconds of data (one
@@ -422,7 +413,6 @@ retry_sco_read:
 
 			uint8_t *buffer;
 			size_t buffer_len;
-			ssize_t len;
 
 			switch (codec) {
 			case HFP_CODEC_CVSD:
@@ -438,20 +428,12 @@ retry_sco_read:
 #endif
 			}
 
-retry_sco_write:
-			errno = 0;
-			if ((len = write(pfds[2].fd, buffer, buffer_len)) <= 0)
-				switch (errno) {
-				case EINTR:
-					goto retry_sco_write;
-				case 0:
-				case ECONNABORTED:
-				case ECONNRESET:
-					goto release;
-				default:
+			ssize_t len;
+			if ((len = io_bt_write(t, buffer, buffer_len)) <= 0) {
+				if (len == -1)
 					error("SCO write error: %s", strerror(errno));
-					continue;
-				}
+				continue;
+			}
 
 			switch (codec) {
 			case HFP_CODEC_CVSD:

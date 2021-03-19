@@ -202,10 +202,10 @@ static ssize_t a2dp_poll_and_read_bt(struct io_thread_data *io, ffb_t *buffer) {
 		{ th->pipe[0], POLLIN, 0 },
 		{ -1, POLLIN, 0 }};
 
+repoll:
+
 	/* Allow escaping from the poll() by thread cancellation. */
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-
-repoll:
 
 	/* Add BT socket to the poll if transport is active. */
 	fds[1].fd = io->t_paused ? -1 : t->bt_fd;
@@ -235,22 +235,12 @@ repoll:
 		}
 	}
 
-	ssize_t len;
-	if ((len = read(fds[1].fd, buffer->tail, ffb_len_in(buffer))) == -1) {
-		debug("BT read error: %s", strerror(errno));
-		goto repoll;
-	}
-
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
-	/* it seems that zero is never returned... */
-	if (len == 0) {
-		debug("BT socket has been closed: %d", fds[1].fd);
-		/* Prevent sending the release request to the BlueZ. If the socket has
-		 * been closed, it means that BlueZ has already closed the connection. */
-		close(fds[1].fd);
-		t->bt_fd = -1;
-		return 0;
+	ssize_t len;
+	if ((len = io_bt_read(t, buffer->tail, ffb_blen_in(buffer))) == -1) {
+		debug("BT read error: %s", strerror(errno));
+		goto repoll;
 	}
 
 	return len;
@@ -260,48 +250,28 @@ repoll:
  * Write data to the BT SEQPACKET socket.
  *
  * Note:
- * This function temporally re-enables thread cancellation! */
+ * This function may temporally re-enables thread cancellation! */
 static ssize_t a2dp_write_bt(struct io_thread_data *io, ffb_t *buffer) {
 
 	struct ba_transport *t = io->th->t;
-	struct pollfd pfd = { t->bt_fd, POLLOUT, 0 };
 	int coutq = 0;
-	int oldstate;
 	ssize_t ret;
 
-	/* BT socket is opened in the non-blocking mode. However, this function
-	 * forcefully operates in a blocking mode - it uses poll() when writing
-	 * to the BT socket would block. Hence, it is required to provide a way
-	 * of escaping from the poll() when the IO thread termination request
-	 * has been made by re-enabling thread cancellation. */
-	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
-
 	/* Try to get the number of bytes queued in the socket output buffer. */
-	if (ioctl(pfd.fd, TIOCOUTQ, &coutq) != -1)
+	if (ioctl(t->bt_fd, TIOCOUTQ, &coutq) != -1)
 		coutq = abs(t->a2dp.bt_fd_coutq_init - coutq);
 
-retry:
-	if ((ret = write(pfd.fd, buffer->data, ffb_len_out(buffer))) == -1)
-		switch (errno) {
-		case EINTR:
-			goto retry;
-		case EAGAIN:
-			poll(&pfd, 1, -1);
-			/* set coutq to some arbitrary big value */
-			coutq = 1024 * 16;
-			goto retry;
-		case ECONNRESET:
-		case ENOTCONN:
-			break;
-		default:
-			error("BT socket write error: %s", strerror(errno));
-			ret = 0;
-		}
+	errno = 0;
+	ret = io_bt_write(t, buffer->data, ffb_blen_out(buffer));
+
+	if (errno == EAGAIN)
+		/* The io_bt_write() call was blocking due to not enough space
+		 * in the BT socket. Set the coutq to some arbitrary big value. */
+		coutq = 1024 * 16;
 
 	io->coutq.i = (io->coutq.i + 1) % ARRAYSIZE(io->coutq.v);
 	io->coutq.v[io->coutq.i] = coutq;
 
-	pthread_setcancelstate(oldstate, NULL);
 	return ret;
 }
 
@@ -578,8 +548,10 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 		rtp_header->timestamp = htobe32(timestamp);
 		rtp_media_header->frame_count = sbc_frames;
 
-		if (a2dp_write_bt(&io, &bt) == -1) {
-			debug("BT socket disconnected: %d", t->bt_fd);
+		ssize_t ret;
+		if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
+			if (ret == -1)
+				error("BT write error: %s", strerror(errno));
 			goto fail;
 		}
 
@@ -945,9 +917,8 @@ static void *a2dp_source_mp3(struct ba_transport_thread *th) {
 				ffb_seek(&bt, RTP_HEADER_LEN + sizeof(*rtp_mpeg_audio_header) + len);
 
 				if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
-					if (ret == 0)
-						break;
-					debug("BT socket disconnected: %d", t->bt_fd);
+					if (ret == -1)
+						error("BT write error: %s", strerror(errno));
 					goto fail;
 				}
 
@@ -1323,9 +1294,8 @@ static void *a2dp_source_aac(struct ba_transport_thread *th) {
 					ffb_seek(&bt, RTP_HEADER_LEN + len);
 
 					if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
-						if (ret == 0)
-							break;
-						debug("BT socket disconnected: %d", t->bt_fd);
+						if (ret == -1)
+							error("BT write error: %s", strerror(errno));
 						goto fail;
 					}
 
@@ -1542,8 +1512,10 @@ static void *a2dp_source_aptx(struct ba_transport_thread *th) {
 
 			}
 
-			if (a2dp_write_bt(&io, &bt) == -1) {
-				debug("BT socket disconnected: %d", t->bt_fd);
+			ssize_t ret;
+			if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
+				if (ret == -1)
+					error("BT write error: %s", strerror(errno));
 				goto fail;
 			}
 
@@ -1758,8 +1730,10 @@ static void *a2dp_source_aptx_hd(struct ba_transport_thread *th) {
 
 			}
 
-			if (a2dp_write_bt(&io, &bt) == -1) {
-				debug("BT socket disconnected: %d", t->bt_fd);
+			ssize_t ret;
+			if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
+				if (ret == -1)
+					error("BT write error: %s", strerror(errno));
 				goto fail;
 			}
 
@@ -2010,9 +1984,11 @@ static void *a2dp_source_ldac(struct ba_transport_thread *th) {
 			input_len -= frames;
 			ffb_seek(&bt, encoded);
 
+			ssize_t ret;
 			if (encoded &&
-					a2dp_write_bt(&io, &bt) == -1) {
-				debug("BT socket disconnected: %d", t->bt_fd);
+					(ret = a2dp_write_bt(&io, &bt)) <= 0) {
+				if (ret == -1)
+					error("BT write error: %s", strerror(errno));
 				goto fail;
 			}
 
